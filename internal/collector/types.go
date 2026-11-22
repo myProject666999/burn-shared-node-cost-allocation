@@ -36,6 +36,7 @@ type NodeInfo struct {
 type PodInfo struct {
 	Name            string
 	Namespace       string
+	Phase           string // corev1.PodPhase: "Running", "Pending", "Succeeded", "Failed"
 	OwnerKind       string // resolved controller: "Deployment", "StatefulSet", "DaemonSet"
 	OwnerName       string
 	CPURequest      int64
@@ -82,6 +83,23 @@ type WorkloadInfo struct {
 	MonthlyCost           float64
 }
 
+// ExcludedPod records a pod that was deliberately excluded from cost allocation
+// so it can never be silently attributed to a real tenant.
+type ExcludedPod struct {
+	Namespace string `json:"namespace"`
+	Name      string `json:"name"`
+	NodeName  string `json:"node_name,omitempty"`
+	Phase     string `json:"phase,omitempty"`
+	Reason    string `json:"reason"`
+}
+
+// Reasons for excluding a pod from cost allocation.
+const (
+	ExcludeReasonNoNode      = "no_node_assigned"
+	ExcludeReasonNoNamespace = "no_namespace"
+	ExcludeReasonTerminated  = "terminated_pod"
+)
+
 type ClusterInfo struct {
 	Nodes         []NodeInfo
 	TotalNodes    int
@@ -89,4 +107,15 @@ type ClusterInfo struct {
 	PVCs          []PVCInfo
 	LoadBalancers []LBServiceInfo
 	Workloads     []WorkloadInfo
+
+	// ExcludedPods lists pods removed from cost allocation with the reason.
+	ExcludedPods []ExcludedPod `json:"excluded_pods,omitempty"`
+
+	// NamespaceLabels maps namespace name to its labels. Read-only input for
+	// label-bucket (e.g. team) allocation. May be nil when labels are unavailable.
+	NamespaceLabels map[string]map[string]string `json:"-"`
+
+	// NamespaceLabelError holds a non-fatal error encountered while reading
+	// namespace labels (e.g. missing list permission in single-namespace mode).
+	NamespaceLabelError string `json:"namespace_label_error,omitempty"`
 }

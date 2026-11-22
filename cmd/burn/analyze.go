@@ -41,6 +41,13 @@ var (
 	gpuPrice      float64
 	storagePrice  float64
 	showSpot      bool
+
+	// Opt-in resource-pool allocation. Disabled by default so legacy reports
+	// are unchanged.
+	poolAllocate       bool
+	poolBasis          string
+	poolNamespaceLabel string
+	poolEmptyAsMissing bool
 )
 
 var analyzeCmd = &cobra.Command{
@@ -67,6 +74,11 @@ func init() {
 	f.Float64Var(&storagePrice, "storage-price", 0, "custom storage price per GiB per month (on-prem)")
 	f.BoolVar(&showSpot, "spot", false, "show spot instance readiness details")
 
+	f.BoolVar(&poolAllocate, "pool-allocation", false, "enable conservation-guaranteed CPU/memory/GPU resource-pool cost allocation (new opt-in report section)")
+	f.StringVar(&poolBasis, "pool-basis", "requests", "resource-pool allocation basis: requests|usage (usage falls back to requests when Prometheus data is missing)")
+	f.StringVar(&poolNamespaceLabel, "pool-namespace-label", "", "namespace label key for label-bucket aggregation, e.g. team (requires --pool-allocation)")
+	f.BoolVar(&poolEmptyAsMissing, "pool-empty-label-is-missing", true, "treat empty-string namespace label values as missing (unlabeled bucket)")
+
 	rootCmd.AddCommand(analyzeCmd)
 }
 
@@ -79,6 +91,10 @@ func runAnalyze(cmd *cobra.Command, _ []string) error {
 
 	if period != "" && !isValidPeriod(period) {
 		return fmt.Errorf("invalid period %q: use Prometheus duration format (e.g. 1h, 7d, 30d)", period)
+	}
+
+	if poolAllocate && poolBasis != analyzer.PoolBasisRequests && poolBasis != analyzer.PoolBasisUsage {
+		return fmt.Errorf("invalid --pool-basis %q: use %q or %q", poolBasis, analyzer.PoolBasisRequests, analyzer.PoolBasisUsage)
 	}
 
 	if withAI && period == "" {
@@ -130,11 +146,14 @@ func runAnalyze(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
-	report, err := analyzer.New(pp).Analyze(ctx, info)
+	report, err := analyzer.NewWithOptions(pp, poolOptions(info)).Analyze(ctx, info)
 	if err != nil {
 		return err
 	}
 	report.Period = coll.Period()
+	if poolAllocate && info.NamespaceLabelError != "" {
+		fmt.Fprintf(os.Stderr, "⚠ namespace labels unavailable (%s) — namespaces grouped into the unlabeled bucket\n", info.NamespaceLabelError)
+	}
 
 	switch output {
 	case "json":
@@ -236,6 +255,21 @@ func outputJSON(report *analyzer.CostReport) error {
 	return enc.Encode(report)
 }
 
+// poolOptions maps CLI flags onto analyzer options. When pool allocation is
+// disabled the zero value is returned and the legacy report is unchanged.
+func poolOptions(info *collector.ClusterInfo) analyzer.Options {
+	if !poolAllocate {
+		return analyzer.Options{}
+	}
+	return analyzer.Options{
+		EnablePoolAllocation: true,
+		PoolBasis:            poolBasis,
+		NamespaceLabelKey:    poolNamespaceLabel,
+		NamespaceLabels:      info.NamespaceLabels,
+		EmptyLabelIsMissing:  poolEmptyAsMissing,
+	}
+}
+
 func outputTable(report *analyzer.CostReport) {
 	hasPrometheus := report.MetricsSource == "prometheus"
 
@@ -292,6 +326,10 @@ func outputTable(report *analyzer.CostReport) {
 
 	if len(report.Namespaces) > 0 {
 		outputNamespaceSummary(report.Namespaces, hasPrometheus, report.MonthlyCost, report.TotalIdleCost)
+	}
+
+	if report.PoolAllocation != nil {
+		outputPoolAllocation(report.PoolAllocation)
 	}
 
 	if len(report.PVCosts) > 0 {
@@ -440,6 +478,49 @@ func outputNamespacePods(pods []analyzer.PodEfficiency, hasPrometheus bool, pvcs
 		for _, pv := range pvcs {
 			fmt.Fprintf(w, "%s\t%s\t%.0fGi\t$%.2f\n",
 				ofmt.Truncate(pv.Name, 30), pv.StorageClass, pv.CapacityGiB, pv.MonthlyCost)
+		}
+		w.Flush()
+	}
+}
+
+func outputPoolAllocation(pool *analyzer.PoolAllocationReport) {
+	fmt.Println("\nRESOURCE POOL ALLOCATION (opt-in)")
+	fmt.Println("─────────────────────────────────")
+	fmt.Printf("Requested basis: %s | Effective basis: cpu=%s memory=%s gpu=%s\n",
+		pool.RequestedBasis,
+		pool.EffectiveBasis["cpu"],
+		pool.EffectiveBasis["memory"],
+		pool.EffectiveBasis["gpu"])
+	if len(pool.BasisFallbacks) > 0 {
+		for _, fb := range pool.BasisFallbacks {
+			fmt.Fprintf(os.Stderr, "⚠ pool %s on node %s fell back to requests: %s\n", fb.Pool, fb.NodeName, fb.Reason)
+		}
+	}
+	fmt.Printf("Analyzed node total: $%.2f/mo | Allocated: $%.2f/mo | Unallocated (listed separately): $%.2f/mo\n",
+		pool.NodeTotalHourly*analyzer.HoursPerMonth, pool.AllocatedMonthly, pool.UnallocatedMonthly)
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "\nNAMESPACE\tCPU $/MO\tMEMORY $/MO\tGPU $/MO\tTOTAL $/MO")
+	for _, ns := range pool.Namespaces {
+		fmt.Fprintf(w, "%s\t$%.2f\t$%.2f\t$%.2f\t$%.2f\n",
+			ofmt.Truncate(ns.Name, 25),
+			ns.CPUHourly*analyzer.HoursPerMonth,
+			ns.MemoryHourly*analyzer.HoursPerMonth,
+			ns.GPUHourly*analyzer.HoursPerMonth,
+			ns.Monthly)
+	}
+	w.Flush()
+
+	if len(pool.LabelBuckets) > 0 {
+		fmt.Printf("\nLABEL BUCKETS (%s)\n", pool.LabelKey)
+		w = tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "LABEL\tNAMESPACES\tTOTAL $/MO")
+		for _, b := range pool.LabelBuckets {
+			label := b.Label
+			if label == pool.UnlabeledBucket {
+				label = "(unlabeled)"
+			}
+			fmt.Fprintf(w, "%s\t%d\t$%.2f\n", ofmt.Truncate(label, 25), b.NamespaceCount, b.Monthly)
 		}
 		w.Flush()
 	}

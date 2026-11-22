@@ -186,7 +186,10 @@ func (c *Collector) Collect(ctx context.Context) (*ClusterInfo, error) {
 	// Build ReplicaSet owner index for Deployment ownership resolution
 	rsOwners := c.buildRSOwnerIndex(ctx)
 
-	// group pods by node
+	// group pods by node. Pods without a node cannot be charged to a node and
+	// are skipped here, preserving the historical collection behavior.
+	// Terminated/no-namespace diagnostics for the opt-in pool allocation are
+	// derived inside that engine (see internal/analyzer/pool_allocation.go).
 	podsByNode := make(map[string][]PodInfo)
 	for _, pod := range podItems {
 		if pod.Spec.NodeName == "" {
@@ -312,14 +315,91 @@ func (c *Collector) Collect(ctx context.Context) (*ClusterInfo, error) {
 		log.Printf("warning: failed to collect workloads: %v", err)
 	}
 
+	// Namespace labels are read-only inputs for label-bucket allocation.
+	// Failure (e.g. missing list permission in single-namespace mode) is
+	// reported once and degrades to the unlabeled bucket rather than failing
+	// the whole analysis.
+	nsLabels, nsLabelErr := c.collectNamespaceLabels(ctx)
+	if nsLabelErr != nil {
+		log.Printf("warning: failed to list namespace labels: %v", nsLabelErr)
+	}
+	nsLabelErrMsg := ""
+	if nsLabelErr != nil {
+		nsLabelErrMsg = nsLabelErr.Error()
+	}
+
 	return &ClusterInfo{
-		Nodes:         nodeInfos,
-		TotalNodes:    len(nodeInfos),
-		TotalPods:     len(podItems),
-		PVCs:          pvcInfos,
-		LoadBalancers: lbInfos,
-		Workloads:     workloads,
+		Nodes:               nodeInfos,
+		TotalNodes:          len(nodeInfos),
+		TotalPods:           len(podItems),
+		PVCs:                pvcInfos,
+		LoadBalancers:       lbInfos,
+		Workloads:           workloads,
+		ExcludedPods:        DeriveExcludedPods(podItems),
+		NamespaceLabels:     nsLabels,
+		NamespaceLabelError: nsLabelErrMsg,
 	}, nil
+}
+
+// DeriveExcludedPods classifies pods that must not receive pool-allocation
+// charges. It runs over the raw pod list (including unscheduled pods, which
+// never reach a node's Pods slice) and is used only by the opt-in pool
+// allocation, so legacy reporting is unchanged.
+func DeriveExcludedPods(pods []corev1.Pod) []ExcludedPod {
+	var excluded []ExcludedPod
+	for _, pod := range pods {
+		switch {
+		case pod.Namespace == "":
+			excluded = append(excluded, ExcludedPod{
+				Name: pod.Name, NodeName: pod.Spec.NodeName,
+				Phase: string(pod.Status.Phase), Reason: ExcludeReasonNoNamespace,
+			})
+		case pod.Spec.NodeName == "":
+			excluded = append(excluded, ExcludedPod{
+				Namespace: pod.Namespace, Name: pod.Name,
+				Phase: string(pod.Status.Phase), Reason: ExcludeReasonNoNode,
+			})
+		case pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed:
+			// Terminated but not yet deleted: its containers no longer consume
+			// node resources.
+			excluded = append(excluded, ExcludedPod{
+				Namespace: pod.Namespace, Name: pod.Name, NodeName: pod.Spec.NodeName,
+				Phase: string(pod.Status.Phase), Reason: ExcludeReasonTerminated,
+			})
+		}
+	}
+	return excluded
+}
+
+// collectNamespaceLabels returns namespace name → labels. In single-namespace
+// mode only that namespace is read, which works without namespace list
+// permission.
+func (c *Collector) collectNamespaceLabels(ctx context.Context) (map[string]map[string]string, error) {
+	result := make(map[string]map[string]string)
+	if c.namespace != "" {
+		ns, err := c.client.CoreV1().Namespaces().Get(ctx, c.namespace, metav1.GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+		result[ns.Name] = ns.Labels
+		return result, nil
+	}
+
+	opts := metav1.ListOptions{Limit: pageSize}
+	for {
+		list, err := c.client.CoreV1().Namespaces().List(ctx, opts)
+		if err != nil {
+			return nil, err
+		}
+		for _, ns := range list.Items {
+			result[ns.Name] = ns.Labels
+		}
+		if list.Continue == "" {
+			break
+		}
+		opts.Continue = list.Continue
+	}
+	return result, nil
 }
 
 // Period returns the effective analysis period (may be adjusted if Prometheus data is limited).
@@ -627,6 +707,7 @@ func parsePod(pod corev1.Pod, rsOwners map[string]rsOwner) PodInfo {
 	return PodInfo{
 		Name:          pod.Name,
 		Namespace:     pod.Namespace,
+		Phase:         string(pod.Status.Phase),
 		OwnerKind:     ownerKind,
 		OwnerName:     ownerName,
 		CPURequest:    cpuReq,

@@ -253,6 +253,48 @@ burn analyze \
 
 Without custom pricing, cloud-equivalent rates are used as defaults.
 
+## Resource-pool cost allocation (opt-in)
+
+The default report keeps its original `max(request, usage) × unit price`
+semantics. For a conservation-guaranteed view — where every allocated cent
+plus an explicitly listed unallocated residual equals the analyzed node
+total — enable resource-pool allocation:
+
+```bash
+burn analyze --pool-allocation --pool-basis requests \
+  --pool-namespace-label team
+```
+
+- Each node's hourly price is split into **CPU**, **memory** and **GPU**
+  pools using the same ratio-based split as the legacy engine
+  (`SplitNodeCost` / `SplitNodeCostWithGPU`), then each pool is allocated
+  independently.
+- `--pool-basis requests` allocates by pod requests. The denominator is
+  `max(sum of pod requests, node allocatable)`: requests below allocatable
+  leave an explicit unallocated residual; over-committed requests are
+  normalized.
+- `--pool-basis usage` allocates by Prometheus usage with the same
+  structure. A pool without usage metrics falls back to requests, and the
+  report records the effective basis per pool plus each fallback. GPU has no
+  usage metric and is always request-based; pods without GPU requests never
+  carry GPU cost.
+- BestEffort pods have zero request-mode share but participate in usage
+  mode when they have measured usage.
+- `--pool-namespace-label <key>` (e.g. `team`) additionally groups the
+  namespace totals into label buckets; namespaces missing the label (or
+  whose labels cannot be read, including single-namespace RBAC) go to a
+  reserved unlabeled bucket that cannot collide with a real label value.
+  Every namespace belongs to exactly one bucket, so label-bucket totals
+  equal namespace totals. Empty-string label values are treated as missing
+  by default (`--pool-empty-label-is-missing`).
+- Terminated (`Succeeded`/`Failed`) pods, pods without a node and pods
+  without a namespace are excluded from allocation and listed separately
+  with their reason instead of being attributed to a tenant.
+
+Storage and load-balancer attribution is unchanged. The new section only
+appears when `--pool-allocation` is passed, so existing reports are never
+silently altered.
+
 ## How it works
 
 ```

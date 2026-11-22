@@ -12,17 +12,29 @@ import (
 )
 
 const (
-	hoursPerMonth    = 730.0
+	// HoursPerMonth is the canonical month length used by every cost field.
+	HoursPerMonth    = 730.0
+	hoursPerMonth    = HoursPerMonth
 	highIdlePercent  = 0.4
 	maxPodEfficiency = 10
 )
 
 type Analyzer struct {
 	pricing pricing.Provider
+	options Options
 }
 
 func New(p pricing.Provider) *Analyzer {
 	return &Analyzer{pricing: p}
+}
+
+// NewWithOptions constructs an Analyzer with opt-in analyses. The zero-value
+// Options (or Options{}) reproduces the legacy report byte-for-byte.
+func NewWithOptions(p pricing.Provider, opts Options) *Analyzer {
+	if opts.PoolBasis == "" {
+		opts.PoolBasis = PoolBasisRequests
+	}
+	return &Analyzer{pricing: p, options: opts}
 }
 
 func (a *Analyzer) Analyze(ctx context.Context, info *collector.ClusterInfo) (*CostReport, error) {
@@ -160,6 +172,15 @@ func (a *Analyzer) Analyze(ctx context.Context, info *collector.ClusterInfo) (*C
 			sorted = sorted[:maxPodEfficiency]
 		}
 		report.InefficientPods = sorted
+	}
+
+	// Excluded pods are reported as diagnostics, never folded into a tenant.
+	report.ExcludedPods = info.ExcludedPods
+
+	// Opt-in resource-pool allocation. Legacy fields above are untouched, so
+	// enabling it cannot silently change an existing report.
+	if a.options.EnablePoolAllocation {
+		report.PoolAllocation = a.calculatePoolAllocation(ctx, info)
 	}
 
 	return report, nil
